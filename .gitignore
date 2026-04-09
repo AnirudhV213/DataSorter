@@ -1,1 +1,2 @@
-producer/data/
+# Ignore all CSV files
+*.csv
