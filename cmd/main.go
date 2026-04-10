@@ -1,12 +1,3 @@
-/*
-package main
-
-import "github.com/AnirudhV16/DataSorter/data"
-
-	func main() {
-		data.GenerateToCSV("C:/Users/AnirudhReddy/DataSorter/producer/data/dummy.csv", 5000000)
-	}
-*/
 package main
 
 import (
@@ -14,49 +5,71 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/AnirudhV16/DataSorter/consumer"
 	"github.com/AnirudhV16/DataSorter/data"
 	"github.com/AnirudhV16/DataSorter/producer"
 )
 
 func main() {
-	// ── flags ──────────────────────────────────────────────────────────────
+	// ── CLI flags ─────────────────────────────────────────────────────────
 	brokerList := flag.String("brokers", "localhost:9092",
 		"comma-separated Kafka broker addresses")
 	csvPath := flag.String("csv", "data.csv",
-		"path to the generated CSV file")
+		"path for the generated CSV file")
 	count := flag.Int("count", 50_000_000,
-		"number of records to generate (skipped if -skip-gen is set)")
+		"number of records to generate")
 	skipGen := flag.Bool("skip-gen", false,
-		"skip CSV generation and use an existing file at -csv")
+		"skip CSV generation — use existing file")
+	skipProduce := flag.Bool("skip-produce", false,
+		"skip producing to Kafka — run sorters only")
 	flag.Parse()
 
 	brokers := strings.Split(*brokerList, ",")
 
-	// ── step 1: generate CSV (optional) ────────────────────────────────────
-	if !*skipGen {
-		fmt.Printf("=== Step 1: Generating %d records → %s ===\n", *count, *csvPath)
-		t0 := time.Now()
-		if err := data.GenerateToCSV(*csvPath, *count); err != nil {
-			fmt.Fprintf(os.Stderr, "generation failed: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Generation complete in %.2fs\n\n", time.Since(t0).Seconds())
-	} else {
-		fmt.Printf("Skipping generation; using existing file %q\n\n", *csvPath)
-	}
-
-	// ── step 2: send CSV → Kafka ────────────────────────────────────────────
-	fmt.Printf("=== Step 2: Sending %s → Kafka topic %q ===\n",
-		*csvPath, producer.TopicSource)
+	// Graceful shutdown on Ctrl-C / SIGTERM.
+	ctx, cancel := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	wall := time.Now()
-	if err := producer.SendCSVToKafka(context.Background(), brokers, *csvPath); err != nil {
-		fmt.Fprintf(os.Stderr, "kafka producer failed: %v\n", err)
-		os.Exit(1)
+
+	// ── Step 1: generate CSV ──────────────────────────────────────────────
+	if !*skipGen {
+		fmt.Printf("═══ Step 1: Generating %d records → %s ═══\n", *count, *csvPath)
+		t0 := time.Now()
+		if err := data.GenerateToCSV(*csvPath, *count); err != nil {
+			fatalf("generation failed: %v", err)
+		}
+		fmt.Printf("Generation done in %.2fs\n\n", time.Since(t0).Seconds())
 	}
 
-	fmt.Printf("\nTotal wall-clock time (gen + produce): %.2fs\n", time.Since(wall).Seconds())
+	// ── Step 2: produce CSV → Kafka source topic ──────────────────────────
+	if !*skipProduce {
+		fmt.Printf("═══ Step 2: Producing %s → Kafka topic %q ═══\n",
+			*csvPath, producer.TopicSource)
+		t0 := time.Now()
+		if err := producer.SendCSVToKafka(ctx, brokers, *csvPath); err != nil {
+			fatalf("kafka producer failed: %v", err)
+		}
+		fmt.Printf("Produce done in %.2fs\n\n", time.Since(t0).Seconds())
+	}
+
+	// ── Step 3: sorter consumers ──────────────────────────────────────────
+	fmt.Printf("═══ Step 3: Running sorters (id / name / continent) ═══\n")
+	if err := consumer.RunAllSorters(ctx, brokers); err != nil {
+		fatalf("sorters failed: %v", err)
+	}
+
+	fmt.Printf("\n✓ Full pipeline complete. Total wall-clock: %.2fs\n",
+		time.Since(wall).Seconds())
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "FATAL: "+format+"\n", args...)
+	os.Exit(1)
 }

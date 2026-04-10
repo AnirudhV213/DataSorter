@@ -75,6 +75,54 @@ func EnsureTopic(brokers []string, topic string, partitions int32) error {
 	return nil
 }
 
+// newAdmin builds a Sarama ClusterAdmin.
+func newAdmin(brokers []string) (sarama.ClusterAdmin, error) {
+	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V2_6_0_0
+	admin, err := sarama.NewClusterAdmin(brokers, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("cluster admin: %w", err)
+	}
+	return admin, nil
+}
+
+// RecreateTopic deletes the topic if it exists, waits for async deletion,
+// then creates it fresh — guaranteeing HWM=0 on every run.
+// RecreateTopic deletes the topic if it exists, waits for async deletion,
+// then creates it fresh — guaranteeing HWM=0 on every run.
+func RecreateTopic(brokers []string, topic string, partitions int32) error {
+	admin, err := newAdmin(brokers)
+	if err != nil {
+		return err
+	}
+	defer admin.Close()
+
+	if err := admin.DeleteTopic(topic); err != nil {
+		// "topic does not exist" is fine — it just means first run.
+		// Any other error is a real problem.
+		kafkaErr, ok := err.(*sarama.TopicError)
+		if !ok || kafkaErr.Err != sarama.ErrUnknownTopicOrPartition {
+			return fmt.Errorf("delete topic %q: %w", topic, err)
+		}
+		// Topic didn't exist — skip the sleep, fall through to create.
+	} else {
+		fmt.Printf("Topic %q deleted (clearing stale data)\n", topic)
+		// Broker deletion is async — wait before recreating to avoid
+		// ErrTopicAlreadyExists being returned immediately after delete.
+		time.Sleep(2 * time.Second)
+	}
+
+	detail := &sarama.TopicDetail{
+		NumPartitions:     partitions,
+		ReplicationFactor: 1,
+	}
+	if err := admin.CreateTopic(topic, detail, false); err != nil {
+		return fmt.Errorf("recreate topic %q: %w", topic, err)
+	}
+	fmt.Printf("Topic %q created fresh with %d partitions\n", topic, partitions)
+	return nil
+}
+
 // ─── Producer config ────────────────────────────────────────────────────────
 
 // newAsyncProducerConfig returns a Sarama config tuned for high throughput
@@ -157,12 +205,42 @@ func newRoundRobinPartitioner(_ string) sarama.Partitioner {
 //
 // The error/success drainer goroutine prevents the async producer's internal
 // channels from filling up, which would block the workers.
-func SendCSVToKafka(ctx context.Context, brokers []string, csvPath string) error {
-	// 1. Ensure the topic exists with 3 partitions.
-	if err := EnsureTopic(brokers, TopicSource, NumPartitions); err != nil {
-		return err
+// topicExists returns true if the topic is already present on the broker.
+func topicExists(brokers []string, topic string) bool {
+	admin, err := newAdmin(brokers)
+	if err != nil {
+		return false
+	}
+	defer admin.Close()
+
+	topics, err := admin.ListTopics()
+	if err != nil {
+		return false
 	}
 
+	_, exists := topics[topic]
+	return exists
+}
+
+func SendCSVToKafka(ctx context.Context, brokers []string, csvPath string) error {
+	// 1. Ensure the topic exists with 3 partitions.
+	//if err := EnsureTopic(brokers, TopicSource, NumPartitions); err != nil {
+	//	return err
+	//}
+
+	/*if err := RecreateTopic(brokers, TopicSource, NumPartitions); err != nil {
+		return err
+	}*/
+
+	if topicExists(brokers, TopicSource) {
+		if err := RecreateTopic(brokers, TopicSource, NumPartitions); err != nil {
+			return err
+		}
+	} else {
+		if err := EnsureTopic(brokers, TopicSource, NumPartitions); err != nil {
+			return err
+		}
+	}
 	// 2. Build the async producer.
 	cfg := newAsyncProducerConfig()
 	cfg.Producer.Partitioner = newRoundRobinPartitioner
