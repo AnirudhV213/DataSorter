@@ -13,6 +13,7 @@ import (
 	"github.com/AnirudhV16/DataSorter/consumer"
 	"github.com/AnirudhV16/DataSorter/data"
 	"github.com/AnirudhV16/DataSorter/producer"
+	"github.com/AnirudhV16/DataSorter/verify"
 )
 
 func main() {
@@ -67,6 +68,12 @@ func main() {
 
 	fmt.Printf("\n✓ Full pipeline complete. Total wall-clock: %.2fs\n",
 		time.Since(wall).Seconds())
+
+	// step4: ------------------------------------------------
+	//verification
+	fmt.Println("verification of sorted data")
+	//tx context.Context, brokers []string, outputDir string
+	verify.VerifyAll(context.Background(), brokers, "/output_csv")
 }
 
 func fatalf(format string, args ...any) {

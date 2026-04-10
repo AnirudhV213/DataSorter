@@ -127,12 +127,17 @@ func (g *Generator) randomContinent() string {
 	return continents[g.rng.Intn(len(continents))]
 }
 
+func (g *Generator) randomID() int32 {
+	return int32(g.rng.Intn(50000000))
+}
+
 // GeneratePerson creates a fully populated random Person.
 func (g *Generator) GeneratePerson() *Person {
-	id := g.flag
-	g.flag += 1
+	//id := g.flag
+	//g.flag += 1
 	return NewPerson(
-		int32(id),
+		//int32(id),
+		g.randomID(),
 		g.randomName(),
 		g.randomAddress(),
 		g.randomContinent(),

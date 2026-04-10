@@ -31,7 +31,7 @@ const (
 	SortByContinent SortKey = "continent"
 )
 
-func (k SortKey) outputTopic() string { return string(k) }
+func (k SortKey) OutputTopic() string { return string(k) }
 
 // ─── Comparators ──────────────────────────────────────────────────────────────
 
@@ -91,7 +91,7 @@ func (s *Sorter) Run(ctx context.Context) error {
 	fmt.Printf("[%s] starting\n", s.key)
 
 	// Ensure the output topic exists (1 partition preserves sort order).
-	if err := producer.EnsureTopic(s.brokers, s.key.outputTopic(), outputPartitions); err != nil {
+	if err := producer.EnsureTopic(s.brokers, s.key.OutputTopic(), outputPartitions); err != nil {
 		return fmt.Errorf("[%s] ensure topic: %w", s.key, err)
 	}
 
@@ -126,7 +126,7 @@ func (s *Sorter) Run(ctx context.Context) error {
 // consumeAll reads every message from every partition of the source topic,
 // stopping precisely at each partition's high-water mark.
 func (s *Sorter) consumeAll(ctx context.Context) ([]*data.Person, error) {
-	client, err := sarama.NewClient(s.brokers, newClientConfig())
+	client, err := sarama.NewClient(s.brokers, NewClientConfig())
 	if err != nil {
 		return nil, fmt.Errorf("new client: %w", err)
 	}
@@ -251,7 +251,7 @@ func (s *Sorter) consumeAll(ctx context.Context) ([]*data.Person, error) {
 }
 
 // newClientConfig returns a Sarama config tuned for bulk partition reads.
-func newClientConfig() *sarama.Config {
+func NewClientConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_6_0_0
 
@@ -277,7 +277,7 @@ func (s *Sorter) produceAll(ctx context.Context, records []*data.Person) error {
 		return fmt.Errorf("async producer: %w", err)
 	}
 
-	outTopic := s.key.outputTopic()
+	outTopic := s.key.OutputTopic()
 
 	// Drain ack/error channels in background to prevent internal deadlock.
 	var sent, failed int64
