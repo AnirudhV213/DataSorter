@@ -27,7 +27,7 @@ const (
 
 	// workerCount controls how many goroutines feed the Kafka async producer.
 	// Saturating the producer with more goroutines than CPU cores gives
-	// diminishing returns; 8 is a good default for a 4-core machine.
+	// diminishing returns; 4 is a good default for a 4-core machine.
 	workerCount = 4
 
 	// batchSize is the number of CSV lines each worker accumulates before
