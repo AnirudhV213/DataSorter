@@ -17,6 +17,7 @@ import (
 
 	"github.com/AnirudhV16/DataSorter/data"
 	"github.com/AnirudhV16/DataSorter/producer"
+
 	"github.com/IBM/sarama"
 )
 
