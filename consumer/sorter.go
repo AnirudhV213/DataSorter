@@ -27,9 +27,11 @@ const (
 
 	outputPartitions = 1
 
-	// chunkSize is how many records we hold in RAM at once during Phase 1.
-	// 500K records × ~130 bytes ≈ 65 MB — comfortably within the 2 GB budget
-	// even with three sorters sharing the process sequentially.
+	// chunkSize: 500K records × ~130 bytes = ~65 MB per sorter.
+	// With 3 parallel sorters: 3 × 65 MB = 195 MB peak for chunks.
+	// Cannot use 1M here — all three sorters allocate their chunk arrays
+	// simultaneously, and combined with Kafka fetch buffers this OOM-kills
+	// the process against the 1 GB Go app limit.
 	chunkSize = 500_000
 )
 
@@ -67,41 +69,27 @@ func lessFor(key SortKey) (lessFunc, error) {
 // Sorter implements an external merge sort so the full 50M dataset is never
 // held in RAM simultaneously.
 //
-// Algorithm — two phases:
+// Memory budget (3 sorters in parallel):
 //
-//  1. CHUNK SORT
-//     Read the source Kafka topic in chunks of `chunkSize` records.
-//     Sort each chunk in memory (≈65 MB peak per chunk).
-//     Write the sorted chunk to a temp CSV file on disk.
-//     Discard the chunk from RAM before reading the next one.
-//
-//  2. K-WAY MERGE
-//     Open all temp files simultaneously.
-//     Use a min-heap (one entry per file) to merge them in sort order.
-//     Only one record per temp file is live in RAM at any moment.
-//     Stream the merged output directly to the Kafka output topic.
-//     Delete temp files when done.
-//
-// Memory profile:
-//
-//	Phase 1: chunkSize × ~130 B ≈ 65 MB
-//	Phase 2: numChunks × ~130 B (one record per file) + heap overhead ≈ ~13 MB
-//	          for 100 chunks of 500K records each
-//	Total peak: ~65 MB — fits easily within the 2 GB budget.
+//	Kafka JVM (pinned):               512 MB
+//	3 × chunk array (500K × 130B):    195 MB
+//	3 × msgCh buffer (50K × 130B):     20 MB
+//	3 × fetch buffers (6MB × 3 parts):  54 MB
+//	Go runtime + misc:                 ~50 MB
+//	                                  --------
+//	Total peak:                        ~831 MB  ← within 1 GB app limit
 type Sorter struct {
 	brokers []string
 	key     SortKey
 	less    lessFunc
-	tmpDir  string // directory for temp chunk files
+	tmpDir  string
 }
 
-// NewSorter constructs a Sorter for the given sort key.
 func NewSorter(brokers []string, key SortKey) (*Sorter, error) {
 	less, err := lessFor(key)
 	if err != nil {
 		return nil, err
 	}
-	// Create a dedicated temp directory for this sorter's chunk files.
 	tmpDir, err := os.MkdirTemp("", "sorter-"+string(key)+"-*")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
@@ -109,23 +97,19 @@ func NewSorter(brokers []string, key SortKey) (*Sorter, error) {
 	return &Sorter{brokers: brokers, key: key, less: less, tmpDir: tmpDir}, nil
 }
 
-// Run executes the full pipeline: consume → chunk-sort → k-way merge → produce.
 func (s *Sorter) Run(ctx context.Context) error {
 	start := time.Now()
 	fmt.Printf("[%s] starting (external merge sort)\n", s.key)
 
-	// Clean up temp files when done regardless of outcome.
 	defer func() {
 		os.RemoveAll(s.tmpDir)
 		fmt.Printf("[%s] temp dir cleaned up\n", s.key)
 	}()
 
-	// Ensure output topic (1 partition preserves merge order).
 	if err := producer.EnsureTopic(s.brokers, s.key.OutputTopic(), outputPartitions); err != nil {
 		return fmt.Errorf("[%s] ensure topic: %w", s.key, err)
 	}
 
-	// Phase 1 — consume from Kafka, sort in chunks, write to temp files.
 	t1 := time.Now()
 	chunkFiles, totalRecords, err := s.chunkSort(ctx)
 	if err != nil {
@@ -134,7 +118,6 @@ func (s *Sorter) Run(ctx context.Context) error {
 	fmt.Printf("[%s] phase1 chunk-sort: %d records → %d chunk files in %.2fs\n",
 		s.key, totalRecords, len(chunkFiles), time.Since(t1).Seconds())
 
-	// Phase 2 — k-way merge chunk files, stream to Kafka output topic.
 	t2 := time.Now()
 	if err := s.mergeAndProduce(ctx, chunkFiles); err != nil {
 		return fmt.Errorf("[%s] merge+produce: %w", s.key, err)
@@ -148,11 +131,9 @@ func (s *Sorter) Run(ctx context.Context) error {
 
 // ─── Phase 1: chunk sort ──────────────────────────────────────────────────────
 
-// chunkSort reads the source topic in chunks of `chunkSize`, sorts each chunk
-// in memory, and writes it to a temp CSV file.
-// Returns the list of temp file paths and total record count.
 func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
-	client, err := sarama.NewClient(s.brokers, NewClientConfig())
+	// Use the memory-conscious parallel config, not the original high-fetch config.
+	client, err := sarama.NewClient(s.brokers, newParallelClientConfig())
 	if err != nil {
 		return nil, 0, fmt.Errorf("new client: %w", err)
 	}
@@ -163,7 +144,6 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 		return nil, 0, fmt.Errorf("list partitions: %w", err)
 	}
 
-	// Collect per-partition stop offsets.
 	type pBounds struct{ oldest, hwm int64 }
 	bounds := make(map[int32]pBounds)
 	for _, p := range partitions {
@@ -186,12 +166,10 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 	}
 	defer directConsumer.Close()
 
-	// msgCh fans in messages from all partition goroutines into one channel.
-	// Buffer = chunkSize so partition readers are never blocked by the
-	// chunk writer.
-	msgCh := make(chan *data.Person, chunkSize/10)
+	// 50K buffer × 130 B = 6.5 MB per sorter (3 sorters = ~20 MB total).
+	// Original was chunkSize/10 = 100K; halved to stay within memory budget.
+	msgCh := make(chan *data.Person, 50_000)
 
-	// Fan-in: one goroutine per partition feeds msgCh.
 	fanInDone := make(chan struct{})
 	var activePartitions int64 = int64(len(partitions))
 	for _, partID := range partitions {
@@ -240,13 +218,11 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 		}(partID, b)
 	}
 
-	// Close msgCh once all partition goroutines finish.
 	go func() {
 		<-fanInDone
 		close(msgCh)
 	}()
 
-	// Chunk writer: drain msgCh, fill a chunk, sort it, flush to disk.
 	var chunkFiles []string
 	var totalRecords int64
 	chunk := make([]*data.Person, 0, chunkSize)
@@ -263,7 +239,7 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 		}
 		chunkFiles = append(chunkFiles, path)
 		totalRecords += int64(len(chunk))
-		chunk = chunk[:0] // reuse backing array — no new allocation
+		chunk = chunk[:0]
 		return nil
 	}
 
@@ -280,7 +256,6 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 			}
 		}
 	}
-	// Flush the final partial chunk.
 	if err := flushChunk(); err != nil {
 		return nil, 0, err
 	}
@@ -288,7 +263,6 @@ func (s *Sorter) chunkSort(ctx context.Context) ([]string, int64, error) {
 	return chunkFiles, totalRecords, nil
 }
 
-// writeChunkFile writes a sorted chunk to a temp CSV file and returns the path.
 func (s *Sorter) writeChunkFile(chunk []*data.Person, idx int) (string, error) {
 	path := filepath.Join(s.tmpDir, fmt.Sprintf("chunk_%05d.csv", idx))
 	f, err := os.Create(path)
@@ -297,7 +271,7 @@ func (s *Sorter) writeChunkFile(chunk []*data.Person, idx int) (string, error) {
 	}
 	defer f.Close()
 
-	w := bufio.NewWriterSize(f, 4*1024*1024) // 4 MB write buffer
+	w := bufio.NewWriterSize(f, 4*1024*1024)
 	for _, p := range chunk {
 		if _, err := fmt.Fprintln(w, p.ToCSV()); err != nil {
 			return "", fmt.Errorf("write chunk record: %w", err)
@@ -308,10 +282,7 @@ func (s *Sorter) writeChunkFile(chunk []*data.Person, idx int) (string, error) {
 
 // ─── Phase 2: k-way merge ────────────────────────────────────────────────────
 
-// mergeAndProduce opens all chunk files, merges them in sort order using a
-// min-heap, and streams each record directly to the Kafka output topic.
 func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error {
-	// Open all chunk files and seed the heap with the first record from each.
 	h := &mergeHeap{less: s.less}
 	readers := make([]*chunkReader, 0, len(chunkFiles))
 
@@ -334,7 +305,6 @@ func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error
 
 	heap.Init(h)
 
-	// Build the Kafka async producer for the output topic.
 	ap, err := sarama.NewAsyncProducer(s.brokers, newOutputProducerConfig())
 	if err != nil {
 		return fmt.Errorf("async producer: %w", err)
@@ -343,7 +313,6 @@ func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error
 	outTopic := s.key.OutputTopic()
 	var sent, failed int64
 
-	// Drain ack/error channels in background.
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
@@ -367,7 +336,6 @@ func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error
 		}
 	}()
 
-	// Pop smallest record from heap, send to Kafka, push next from same file.
 	for h.Len() > 0 {
 		select {
 		case <-ctx.Done():
@@ -381,7 +349,6 @@ func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error
 			Value: sarama.StringEncoder(entry.person.ToCSV()),
 		}
 
-		// Advance the reader this entry came from and push its next record.
 		r := readers[entry.readerIdx]
 		if next := r.peek(); next != nil {
 			heap.Push(h, &heapEntry{person: next, readerIdx: entry.readerIdx})
@@ -400,12 +367,11 @@ done:
 
 // ─── Chunk file reader ────────────────────────────────────────────────────────
 
-// chunkReader reads Person records one at a time from a sorted temp CSV file.
 type chunkReader struct {
 	idx    int
 	file   *os.File
 	reader *csv.Reader
-	next   *data.Person // pre-read next record (nil = EOF)
+	next   *data.Person
 }
 
 func newChunkReader(path string, idx int) (*chunkReader, error) {
@@ -415,15 +381,13 @@ func newChunkReader(path string, idx int) (*chunkReader, error) {
 	}
 	r := &chunkReader{idx: idx, file: f, reader: csv.NewReader(bufio.NewReaderSize(f, 32*1024))}
 	r.reader.FieldsPerRecord = 4
-	r.reader.ReuseRecord = true // reuse backing array — avoids per-row allocation
-	r.advance()                 // pre-load first record
+	r.reader.ReuseRecord = true
+	r.advance()
 	return r, nil
 }
 
-// peek returns the next record without consuming it (nil at EOF).
 func (r *chunkReader) peek() *data.Person { return r.next }
 
-// advance reads the next record from the file into r.next.
 func (r *chunkReader) advance() {
 	fields, err := r.reader.Read()
 	if err == io.EOF {
@@ -439,8 +403,6 @@ func (r *chunkReader) advance() {
 		r.next = nil
 		return
 	}
-	// Copy strings out of the reused record buffer before the next Read() call
-	// overwrites them.
 	r.next = &data.Person{
 		ID:        int32(id64),
 		Name:      strings.TrimSpace(fields[1]),
@@ -449,11 +411,9 @@ func (r *chunkReader) advance() {
 	}
 }
 
-func (r *chunkReader) close() {
-	r.file.Close()
-}
+func (r *chunkReader) close() { r.file.Close() }
 
-// ─── Min-heap for k-way merge ─────────────────────────────────────────────────
+// ─── Min-heap ─────────────────────────────────────────────────────────────────
 
 type heapEntry struct {
 	person    *data.Person
@@ -478,9 +438,10 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
-// ─── Shared configs ───────────────────────────────────────────────────────────
+// ─── Configs ──────────────────────────────────────────────────────────────────
 
-// NewClientConfig is exported so verify.go can reuse it.
+// NewClientConfig is kept for verify.go which runs alone after all sorters
+// complete — fetch buffers don't compete with anything at that point.
 func NewClientConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_6_0_0
@@ -492,16 +453,35 @@ func NewClientConfig() *sarama.Config {
 	return cfg
 }
 
+// newParallelClientConfig is used during parallel sorter execution.
+// Fetch buffers are sized so that 3 sorters × 3 partitions fits within budget:
+//
+//	3 × 3 partitions × 6 MB default = 54 MB   (was 10 MB default → 90 MB,
+//	and Fetch.Max 50 MB meant spikes up to 450 MB — the OOM trigger).
+func newParallelClientConfig() *sarama.Config {
+	cfg := sarama.NewConfig()
+	cfg.Version = sarama.V2_6_0_0
+	cfg.Consumer.Fetch.Min = 1
+	cfg.Consumer.Fetch.Default = 6 * 1024 * 1024 // 6 MB  (was 10 MB)
+	cfg.Consumer.Fetch.Max = 12 * 1024 * 1024    // 12 MB (was 50 MB)
+	cfg.Consumer.MaxWaitTime = 500 * time.Millisecond
+	cfg.Consumer.Retry.Backoff = 200 * time.Millisecond
+	return cfg
+}
+
 func newOutputProducerConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_6_0_0
-	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	// WaitForLocal: single broker + RF=1 means WaitForAll adds latency with
+	// zero durability benefit. Critical fix for the continent sorter's
+	// 1328s merge phase — it was stalling waiting for unnecessary ISR acks.
+	cfg.Producer.RequiredAcks = sarama.WaitForLocal
 	cfg.Producer.Compression = sarama.CompressionSnappy
-	cfg.Producer.Flush.Messages = 64_000
-	cfg.Producer.Flush.Frequency = 100 * time.Millisecond
+	cfg.Producer.Flush.Messages = 100_000
+	cfg.Producer.Flush.Frequency = 200 * time.Millisecond
 	cfg.Producer.Retry.Max = 5
 	cfg.Producer.Retry.Backoff = 200 * time.Millisecond
-	cfg.ChannelBufferSize = 1_000_000
+	cfg.ChannelBufferSize = 2_000_000
 	cfg.Producer.Return.Successes = true
 	cfg.Producer.Return.Errors = true
 	return cfg
