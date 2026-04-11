@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
 
   kafka:
@@ -23,32 +21,61 @@ services:
 
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
       KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
-
       KAFKA_NUM_NETWORK_THREADS: 3
       KAFKA_NUM_IO_THREADS: 4
+
+      # Pin JVM heap to exactly 512MB.
+      # Without this the JVM auto-sizes to 25% of container RAM and its
+      # off-heap buffers blow the budget unpredictably.
+      # Setting Xms == Xmx also prevents heap resize pauses during GC.
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"      # hard cap — kernel throttles if exceeded
+          memory: "1GB"    # hard cap — kernel OOM-kills if exceeded
+        reservations:
+          cpus: "1.0"      # guaranteed minimum so Kafka is never starved
+          memory: "600MB"
 
     healthcheck:
       test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
       timeout: 10s
       retries: 10
+      start_period: 30s    # give KRaft time to elect itself on first boot
 
   app:
-    build: .
+    image: golang:1.26.1
     container_name: go-app
 
     depends_on:
       kafka:
-        condition: service_healthy   # ✅ important
+        condition: service_healthy
 
     environment:
       KAFKA_BROKERS: kafka:9092
 
-    command: ["go", "run", "main.go"]
+      # Tell the Go scheduler how many OS threads to use.
+      # Without this Go reads the HOST cpu count (14 in your machine) and
+      # creates 14 threads that all fight for the 2 CPUs this container
+      # is actually allowed — causing the 300-500% CPU spike you saw.
+      GOMAXPROCS: "2"
+
+    working_dir: /app
 
     volumes:
       - .:/app
 
-    working_dir: /app
+    command: ["go", "run", "./cmd/main.go"]
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"      # Go app gets the other 2 of the 4 total cores
+          memory: "1GB"    # leaves 1GB for Kafka on the same host
+        reservations:
+          cpus: "0.5"
+          memory: "200MB"

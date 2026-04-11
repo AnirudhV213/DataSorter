@@ -18,7 +18,12 @@ import (
 
 func main() {
 	// ── CLI flags ─────────────────────────────────────────────────────────
-	brokerList := flag.String("brokers", "localhost:9092",
+	brokersEnv := os.Getenv("KAFKA_BROKERS")
+	if brokersEnv == "" {
+		brokersEnv = "localhost:9092" // fallback
+	}
+
+	brokerList := flag.String("brokers", brokersEnv,
 		"comma-separated Kafka broker addresses")
 	csvPath := flag.String("csv", "data.csv",
 		"path for the generated CSV file")

@@ -28,7 +28,7 @@ const (
 	// workerCount controls how many goroutines feed the Kafka async producer.
 	// Saturating the producer with more goroutines than CPU cores gives
 	// diminishing returns; 8 is a good default for a 4-core machine.
-	workerCount = 8
+	workerCount = 4
 
 	// batchSize is the number of CSV lines each worker accumulates before
 	// sending to the async producer.  Larger batches reduce channel overhead.
@@ -36,7 +36,7 @@ const (
 
 	// channelBuffer is the depth of the line-distribution channel.
 	// Deep enough to keep workers fed even when the reader briefly stalls.
-	channelBuffer = 50_000
+	channelBuffer = 5000
 
 	// progressInterval — print a progress line every N messages sent.
 	progressInterval = 5_000_000
@@ -149,7 +149,7 @@ func newAsyncProducerConfig() *sarama.Config {
 	cfg.Producer.Compression = sarama.CompressionSnappy
 
 	// Batching — flush when 64 K messages accumulated OR 100 ms elapsed
-	cfg.Producer.Flush.Messages = 64_000
+	cfg.Producer.Flush.Messages = 5000
 	cfg.Producer.Flush.Frequency = 100 * time.Millisecond
 
 	// Retry on transient errors
@@ -157,7 +157,7 @@ func newAsyncProducerConfig() *sarama.Config {
 	cfg.Producer.Retry.Backoff = 200 * time.Millisecond
 
 	// Deep channel so workers are never blocked waiting for the producer
-	cfg.ChannelBufferSize = 1_000_000
+	cfg.ChannelBufferSize = 10_000
 
 	// Return successes and errors so we can count them and drain the channels
 	cfg.Producer.Return.Successes = true
