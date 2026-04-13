@@ -16,32 +16,26 @@ import (
 )
 
 func main() {
-	// ── CLI flags ─────────────────────────────────────────────────────────
 	brokersEnv := os.Getenv("KAFKA_BROKERS")
 	if brokersEnv == "" {
-		brokersEnv = "localhost:9092" // fallback
+		brokersEnv = "localhost:9092"
 	}
 
-	brokerList := flag.String("brokers", brokersEnv,
-		"comma-separated Kafka broker addresses")
-	csvPath := flag.String("csv", "data.csv",
-		"path for the generated CSV file")
-	count := flag.Int("count", 50_000_000,
-		"number of records to generate")
-	skipGen := flag.Bool("skip-gen", false,
-		"skip CSV generation — use existing file")
-	skipProduce := flag.Bool("skip-produce", false,
-		"skip producing to Kafka — run sorters only")
+	brokerList := flag.String("brokers", brokersEnv, "comma-separated Kafka broker addresses")
+	csvPath := flag.String("csv", "data.csv", "path for the generated CSV file")
+	count := flag.Int("count", 50_000_000, "number of records to generate")
+	skipGen := flag.Bool("skip-gen", false, "skip CSV generation — use existing file")
+	skipProduce := flag.Bool("skip-produce", false, "skip producing to Kafka — run sorters only")
 	flag.Parse()
 
 	brokers := strings.Split(*brokerList, ",")
 
-	// Graceful shutdown on Ctrl-C / SIGTERM.
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	wall := time.Now()
+
+	var stepGenDur, stepProduceDur, stepSortDur time.Duration
 
 	// ── Step 1: generate CSV ──────────────────────────────────────────────
 	if !*skipGen {
@@ -50,28 +44,50 @@ func main() {
 		if err := data.GenerateToCSV(*csvPath, *count); err != nil {
 			fatalf("generation failed: %v", err)
 		}
-		fmt.Printf("Generation done in %.2fs\n\n", time.Since(t0).Seconds())
+		stepGenDur = time.Since(t0)
+		fmt.Printf("Generation done in %.2fs\n\n", stepGenDur.Seconds())
 	}
 
 	// ── Step 2: produce CSV → Kafka source topic ──────────────────────────
 	if !*skipProduce {
-		fmt.Printf("═══ Step 2: Producing %s → Kafka topic %q ═══\n",
-			*csvPath, producer.TopicSource)
+		fmt.Printf("═══ Step 2: Producing %s → Kafka topic %q ═══\n", *csvPath, producer.TopicSource)
 		t0 := time.Now()
 		if err := producer.SendCSVToKafka(ctx, brokers, *csvPath); err != nil {
 			fatalf("kafka producer failed: %v", err)
 		}
-		fmt.Printf("Produce done in %.2fs\n\n", time.Since(t0).Seconds())
+		stepProduceDur = time.Since(t0)
+		fmt.Printf("Produce done in %.2fs\n\n", stepProduceDur.Seconds())
 	}
 
 	// ── Step 3: sorter consumers ──────────────────────────────────────────
 	fmt.Printf("═══ Step 3: Running sorters (id / name / continent) ═══\n")
+	t0 := time.Now()
 	if err := consumer.RunAllSorters(ctx, brokers); err != nil {
 		fatalf("sorters failed: %v", err)
 	}
+	stepSortDur = time.Since(t0)
 
-	fmt.Printf("\n✓ Full pipeline complete. Total wall-clock: %.2fs\n",
-		time.Since(wall).Seconds())
+	totalDur := time.Since(wall)
+
+	// ── Summary ───────────────────────────────────────────────────────────
+	fmt.Println()
+	fmt.Println("══════════════════════════════════════════")
+	fmt.Println("             Pipeline Summary             ")
+	fmt.Println("══════════════════════════════════════════")
+	if !*skipGen {
+		fmt.Printf("  Step 1 — CSV generation:   %8.2fs\n", stepGenDur.Seconds())
+	} else {
+		fmt.Printf("  Step 1 — CSV generation:   (skipped)\n")
+	}
+	if !*skipProduce {
+		fmt.Printf("  Step 2 — Kafka produce:    %8.2fs\n", stepProduceDur.Seconds())
+	} else {
+		fmt.Printf("  Step 2 — Kafka produce:    (skipped)\n")
+	}
+	fmt.Printf("  Step 3 — Sort & publish:   %8.2fs\n", stepSortDur.Seconds())
+	fmt.Println("  ──────────────────────────────────────")
+	fmt.Printf("  Total wall-clock:          %8.2fs\n", totalDur.Seconds())
+	fmt.Println("══════════════════════════════════════════")
 }
 
 func fatalf(format string, args ...any) {

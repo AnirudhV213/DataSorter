@@ -1,31 +1,46 @@
 # How to Run
 
+**Prerequisites:** Docker and Docker Compose. Nothing else.
+
 ---
 
-## Quick Start with Docker Compose (build from source)
+## Option 1 — Pull image from Docker Hub (recommended)
 
-Use this if you have the source code and want to build and run the pipeline locally.
+No source code needed. Just run:
 
-**Prerequisites:** Docker and Docker Compose. No Go or Kafka installation required.
-
-**1. Get the project files.** Clone the repo — you need `docker-compose.yaml` and the full source tree.
-
-**2. Clean any previous run** (required before each run):
 ```bash
-docker-compose down
+docker compose up
 ```
 
-**3. Build and start the pipeline:**
+Compose pulls `apache/kafka:3.7.0` and `aavv4/datasorter-app:latest` from Docker Hub, starts Kafka, waits for it to be healthy, then runs the full pipeline automatically.
+
+**Stop:**
 ```bash
-docker-compose up --build
+docker compose down
 ```
 
-This will:
-- Start Kafka in KRaft mode (no Zookeeper) with a pinned 512 MB JVM heap.
-- Wait for Kafka to be healthy, then start the `app` container.
-- Run the full pipeline inside `app`: generate 50M CSV records → produce to `source` topic → sort in parallel by `id`, `name`, and `continent` → write to three output topics.
+---
 
-**4. Wait for completion.** The console prints a step-by-step wall-clock summary when done:
+## Option 2 — Build from source locally
+
+Use this if you have cloned the repo and want to build the image yourself.
+
+```bash
+docker compose up --build
+```
+
+The `--build` flag forces Docker to build the app image from the local source instead of pulling it from Docker Hub.
+
+**Stop:**
+```bash
+docker compose down
+```
+
+---
+
+## Wait for completion
+
+Both options print a step-by-step summary when the pipeline finishes:
 
 ```
 ═══ Step 1: Generating 50000000 records → data.csv ═══
@@ -34,41 +49,37 @@ This will:
 ✓ Full pipeline complete. Total wall-clock: ~800s
 ```
 
-**5. Verify correctness** (optional). On Windows:
-```bat
-scripts\verify.bat
-```
+---
+
+## Verify correctness (optional)
+
 On Linux/macOS:
 ```bash
 ./scripts/verify.sh
 ```
-This prints the first 10 records from each output topic (`id`, `name`, `continent`). Check that:
-- **id**: records are in ascending numeric order by the first column.
-- **name**: records are in ascending alphabetical order by the second column.
-- **continent**: records are grouped in ascending alphabetical order by the fourth column.
-
-**6. Stop and remove containers:**
-```bash
-docker-compose down
+On Windows:
+```bat
+scripts\verify.bat
 ```
+
+Prints the first 10 records from each output topic. Check that:
+- **id** — ascending numeric order by the first column.
+- **name** — ascending alphabetical order by the second column.
+- **continent** — ascending alphabetical order by the fourth column.
 
 ---
 
-## Local Development (optional)
 
-If you want to run the pipeline directly on your machine without Docker:
+## Local Development (no Docker)
 
-### Prerequisites
-- Go 1.26.1+
-- Kafka running on `localhost:9092`
+**Prerequisites:** Go 1.26.1+, Kafka running on `localhost:9092`.
 
-### Run the pipeline
 ```bash
 export KAFKA_BROKERS=localhost:9092
 go run ./cmd/main.go
 ```
 
-### CLI flags
+**CLI flags:**
 
 | Flag | Default | Description |
 |---|---|---|
@@ -78,14 +89,7 @@ go run ./cmd/main.go
 | `-skip-gen` | `false` | Skip CSV generation — use an existing file |
 | `-skip-produce` | `false` | Skip producing to Kafka — run sorters only |
 
-Example — rerun just the sorters on an already-produced topic:
-```bash
-go run ./cmd/main.go -skip-gen -skip-produce=false -skip-gen=true
-# or more simply:
-go run ./cmd/main.go -skip-gen
-```
-
-### Run tests
+**Run tests:**
 ```bash
 go test ./...
 ```
@@ -100,10 +104,3 @@ go test ./...
 | `id` | 1 | Records sorted ascending by id |
 | `name` | 1 | Records sorted ascending by name |
 | `continent` | 1 | Records sorted ascending by continent |
-
----
-
-## Stop
-```bash
-docker-compose down
-```

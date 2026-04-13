@@ -189,7 +189,6 @@ func TestChunkFileRoundTrip(t *testing.T) {
 		{ID: 1, Name: "Alice", Address: "1 A Ave", Continent: "Europe"},
 		{ID: 2, Name: "Bob", Address: "2 B Blvd", Continent: "Africa"},
 	}
-	// Sort before writing (as the real flushChunk does).
 	sort.Slice(input, func(i, j int) bool { return s.less(input[i], input[j]) })
 
 	path, err := s.writeChunkFile(input, 0)
@@ -223,7 +222,6 @@ func TestChunkFileRoundTrip(t *testing.T) {
 }
 
 func TestChunkFileRoundTrip_PreservesOrder(t *testing.T) {
-	// Verify that whatever order is written is exactly what is read back.
 	tmpDir, _ := os.MkdirTemp("", "sorter-order-*")
 	defer os.RemoveAll(tmpDir)
 
@@ -281,20 +279,22 @@ func TestChunkReader_MalformedLine(t *testing.T) {
 		t.Fatalf("newChunkReader: %v", err)
 	}
 	defer r.close()
-	// Malformed lines should be skipped — peek returns nil.
+
+	// csv.Reader with FieldsPerRecord=4 rejects lines with wrong field count;
+	// advance() sets next=nil on any read error, so peek must return nil.
 	if r.peek() != nil {
-		t.Logf("peek returned non-nil for malformed lines (may be tolerated)")
+		t.Error("peek should return nil for malformed lines")
 	}
 }
 
-// ─── Cardinality probe / bucket sort path selection ───────────────────────────
+// ─── Cardinality probe ────────────────────────────────────────────────────────
 
 func TestCardinalityProbe_LowCardinality(t *testing.T) {
-	// Simulate continent: 6 distinct values in 500K records → bucket sort.
+	// 6 continent values must fall below the bucket-sort threshold.
 	continents := []string{"Africa", "Asia", "Australia", "Europe", "North America", "South America"}
-	distinct := make(map[string]struct{})
-	for i := 0; i < 500_000; i++ {
-		distinct[continents[i%len(continents)]] = struct{}{}
+	distinct := make(map[string]struct{}, len(continents))
+	for _, c := range continents {
+		distinct[c] = struct{}{}
 	}
 	if len(distinct) >= lowCardinalityThreshold {
 		t.Errorf("continent cardinality %d should be < threshold %d",
@@ -303,9 +303,9 @@ func TestCardinalityProbe_LowCardinality(t *testing.T) {
 }
 
 func TestCardinalityProbe_HighCardinality(t *testing.T) {
-	// Simulate name / id: many distinct values → external merge sort.
-	distinct := make(map[string]struct{})
-	for i := 0; i < 500_000; i++ {
+	// Unique name/id values must exceed the threshold to trigger merge sort.
+	distinct := make(map[string]struct{}, lowCardinalityThreshold+1)
+	for i := 0; i <= lowCardinalityThreshold; i++ {
 		distinct[fmt.Sprintf("name_%d", i)] = struct{}{}
 	}
 	if len(distinct) < lowCardinalityThreshold {
@@ -317,37 +317,25 @@ func TestCardinalityProbe_HighCardinality(t *testing.T) {
 // ─── Bucket sort correctness ──────────────────────────────────────────────────
 
 func TestBucketSortOutput_ContinentOrder(t *testing.T) {
-	// Write records for 3 continents into bucket files manually, then verify
-	// that reading them in sorted key order produces the correct sequence.
 	tmpDir, _ := os.MkdirTemp("", "bucket-test-*")
 	defer os.RemoveAll(tmpDir)
 
-	type bucket struct{ key, safe string }
-	buckets := []bucket{
-		{"Africa", "Africa"},
-		{"Asia", "Asia"},
-		{"Europe", "Europe"},
+	records := map[string]*data.Person{
+		"Africa": {ID: 3, Name: "C", Address: "3 C St", Continent: "Africa"},
+		"Europe": {ID: 1, Name: "A", Address: "1 A Ave", Continent: "Europe"},
+		"Asia":   {ID: 2, Name: "B", Address: "2 B Blvd", Continent: "Asia"},
 	}
 
-	records := map[string][]*data.Person{
-		"Africa": {{ID: 3, Name: "C", Address: "3 C St", Continent: "Africa"}},
-		"Europe": {{ID: 1, Name: "A", Address: "1 A Ave", Continent: "Europe"}},
-		"Asia":   {{ID: 2, Name: "B", Address: "2 B Blvd", Continent: "Asia"}},
-	}
-
-	// Write bucket files.
-	for _, b := range buckets {
-		path := filepath.Join(tmpDir, fmt.Sprintf("bucket_%s.csv", b.safe))
+	for key, p := range records {
+		path := filepath.Join(tmpDir, fmt.Sprintf("bucket_%s.csv", key))
 		f, _ := os.Create(path)
 		w := bufio.NewWriter(f)
-		for _, p := range records[b.key] {
-			fmt.Fprintln(w, p.ToCSV())
-		}
+		fmt.Fprintln(w, p.ToCSV())
 		w.Flush()
 		f.Close()
 	}
 
-	// Read in sorted key order.
+	// Read buckets in sorted key order and collect continent fields.
 	keys := []string{"Africa", "Asia", "Europe"}
 	var got []string
 	for _, k := range keys {
@@ -357,37 +345,31 @@ func TestBucketSortOutput_ContinentOrder(t *testing.T) {
 		for scanner.Scan() {
 			parts := strings.SplitN(scanner.Text(), ",", 4)
 			if len(parts) == 4 {
-				got = append(got, parts[3]) // continent field
+				got = append(got, parts[3])
 			}
 		}
 		f.Close()
 	}
 
-	want := []string{"Africa", "Asia", "Europe"}
-	for i, w := range want {
-		if got[i] != w {
-			t.Errorf("position %d: got %q, want %q", i, got[i], w)
+	for i, want := range keys {
+		if got[i] != want {
+			t.Errorf("position %d: got %q, want %q", i, got[i], want)
 		}
 	}
 }
 
 func TestBucketSortOutput_NorthAmericaSanitised(t *testing.T) {
-	// "North America" becomes "North_America" in filename — verify sanitisation.
-	safe := strings.ReplaceAll("North America", " ", "_")
-	if safe != "North_America" {
-		t.Errorf("sanitised name = %q, want %q", safe, "North_America")
+	if got := strings.ReplaceAll("North America", " ", "_"); got != "North_America" {
+		t.Errorf("sanitised name = %q, want %q", got, "North_America")
 	}
-	safe2 := strings.ReplaceAll("South America", " ", "_")
-	if safe2 != "South_America" {
-		t.Errorf("sanitised name = %q, want %q", safe2, "South_America")
+	if got := strings.ReplaceAll("South America", " ", "_"); got != "South_America" {
+		t.Errorf("sanitised name = %q, want %q", got, "South_America")
 	}
 }
 
-// ─── externalMergeSort sort correctness (unit-level) ─────────────────────────
+// ─── External merge sort correctness ─────────────────────────────────────────
 
 func TestExternalMergeSort_ChunkSortCorrectness(t *testing.T) {
-	// Sort a slice of Persons by ID and verify ordering — the same logic
-	// used in flushChunk.
 	less, _ := lessFor(SortByID)
 	persons := []*data.Person{
 		{ID: 9}, {ID: 3}, {ID: 7}, {ID: 1}, {ID: 5}, {ID: 2}, {ID: 8}, {ID: 4}, {ID: 6},
@@ -420,7 +402,6 @@ func TestExternalMergeSort_NameSortCorrectness(t *testing.T) {
 }
 
 func TestExternalMergeSort_KWayMerge(t *testing.T) {
-	// Simulate a 3-way merge of sorted chunks and verify output is fully sorted.
 	tmpDir, _ := os.MkdirTemp("", "merge-test-*")
 	defer os.RemoveAll(tmpDir)
 
@@ -442,7 +423,6 @@ func TestExternalMergeSort_KWayMerge(t *testing.T) {
 		chunkPaths = append(chunkPaths, path)
 	}
 
-	// Open readers and seed heap.
 	h := &mergeHeap{less: less}
 	readers := make([]*chunkReader, len(chunkPaths))
 	for i, path := range chunkPaths {
@@ -483,11 +463,7 @@ func TestExternalMergeSort_KWayMerge(t *testing.T) {
 // ─── Config sanity checks ─────────────────────────────────────────────────────
 
 func TestConstants_ChunkSize(t *testing.T) {
-	// chunkSize must be large enough for meaningful batching but not so large
-	// that 3 parallel sorters exceed the 1 GB app memory limit.
-	// 3 × 500K × 130 B ≈ 195 MB — safe.
-	// 3 × 1M  × 130 B ≈ 390 MB — also within 1 GB but leaves little headroom
-	// once fetch buffers and producer channels are added.
+	// 3 × 500K × 130B ≈ 195MB — safe within the 1GB app limit.
 	const maxSafeParallelChunkSize = 600_000
 	if chunkSize > maxSafeParallelChunkSize {
 		t.Errorf("chunkSize %d exceeds safe parallel limit %d", chunkSize, maxSafeParallelChunkSize)
@@ -498,20 +474,19 @@ func TestConstants_ChunkSize(t *testing.T) {
 }
 
 func TestConstants_LowCardinalityThreshold(t *testing.T) {
-	// Must be above the 6 continent values but well below typical name/id cardinality.
+	// Must be above 6 (continent count) but well below typical name/id cardinality.
 	if lowCardinalityThreshold <= 6 {
 		t.Errorf("lowCardinalityThreshold %d must be > 6 (continent count)", lowCardinalityThreshold)
 	}
 	if lowCardinalityThreshold > 10_000 {
-		t.Errorf("lowCardinalityThreshold %d is too high — name sort may wrongly use bucket sort", lowCardinalityThreshold)
+		t.Errorf("lowCardinalityThreshold %d too high — name sort may wrongly use bucket sort", lowCardinalityThreshold)
 	}
 }
 
 func TestConfig_ParallelClientFetchMax(t *testing.T) {
 	cfg := newParallelClientConfig()
 	// 3 sorters × 3 partitions × Fetch.Max must stay within reason.
-	// Fetch.Max was 50 MB before → 450 MB just for fetch buffers → OOM.
-	// Now must be ≤ 16 MB.
+	// Keep at or below 16MB to avoid OOM with 3 concurrent sorters.
 	const maxFetch = 16 * 1024 * 1024
 	if cfg.Consumer.Fetch.Max > maxFetch {
 		t.Errorf("Fetch.Max %d exceeds safe limit %d for parallel execution",
@@ -521,20 +496,17 @@ func TestConfig_ParallelClientFetchMax(t *testing.T) {
 
 func TestConfig_OutputProducerChannelBuffer(t *testing.T) {
 	cfg := newOutputProducerConfig()
-	// ChannelBufferSize was 2_000_000 → ~400 MB per producer → OOM with 3.
-	// Must be ≤ 100_000 for safe concurrent operation.
+	// 3 concurrent producers — keep ChannelBufferSize small to avoid OOM.
 	const maxBuffer = 100_000
 	if cfg.ChannelBufferSize > maxBuffer {
-		t.Errorf("ChannelBufferSize %d too large — 3 concurrent producers will OOM (limit %d)",
+		t.Errorf("ChannelBufferSize %d too large for 3 concurrent producers (limit %d)",
 			cfg.ChannelBufferSize, maxBuffer)
 	}
 }
 
 func TestConfig_OutputProducerAcks(t *testing.T) {
 	cfg := newOutputProducerConfig()
-	// Must be WaitForLocal (1), not WaitForAll (-1).
-	// WaitForAll on a single-broker RF=1 cluster added latency with no
-	// durability benefit and was the main cause of continent sort slowness.
+	// WaitForLocal (1) is correct for a single-broker RF=1 cluster.
 	if cfg.Producer.RequiredAcks != 1 {
 		t.Errorf("RequiredAcks = %d, want 1 (WaitForLocal)", cfg.Producer.RequiredAcks)
 	}

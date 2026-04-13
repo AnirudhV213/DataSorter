@@ -28,7 +28,6 @@ func TestPersonToCSV_NegativeID(t *testing.T) {
 }
 
 func TestPersonToCSV_RoundTrip(t *testing.T) {
-	// ToCSV output must be parseable back into the same record.
 	p := NewPerson(123, "TestName", "5 Road Blvd", "Africa")
 	csv := p.ToCSV()
 	parts := strings.SplitN(csv, ",", 4)
@@ -101,7 +100,6 @@ func TestGeneratorAddressLength(t *testing.T) {
 }
 
 func TestGeneratorAddressHasDigitAndSpace(t *testing.T) {
-	// The schema guarantees a digit at index 0 and space at index 2.
 	g := NewGenerator()
 	for i := 0; i < 500; i++ {
 		p := g.GeneratePerson()
@@ -131,8 +129,7 @@ func TestGeneratorProducesDistinctRecords(t *testing.T) {
 		p := g.GeneratePerson()
 		key := p.ToCSV()
 		if seen[key] {
-			// Collision is possible but astronomically unlikely for 1000 records.
-			t.Logf("duplicate record (acceptable if rare): %q", key)
+			t.Logf("duplicate record (name+address collisions are possible): %q", key)
 		}
 		seen[key] = true
 	}
@@ -165,10 +162,9 @@ func TestGenerateToCSV_RecordCount(t *testing.T) {
 	for scanner.Scan() {
 		lines++
 	}
-	// File has 1 header + n data lines.
-	want := n + 1
-	if lines != want {
-		t.Errorf("line count = %d, want %d", lines, want)
+	// 1 header + n data lines.
+	if lines != n+1 {
+		t.Errorf("line count = %d, want %d", lines, n+1)
 	}
 }
 
@@ -261,7 +257,6 @@ func TestGenerateToCSV_ZeroRecords(t *testing.T) {
 	for scanner.Scan() {
 		lines++
 	}
-	// Only the header.
 	if lines != 1 {
 		t.Errorf("0 records: expected 1 line (header), got %d", lines)
 	}

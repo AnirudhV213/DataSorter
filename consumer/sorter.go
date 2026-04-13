@@ -28,14 +28,13 @@ const (
 
 	outputPartitions = 1
 
-	// chunkSize: 500K records × ~130 bytes = ~65 MB per sorter.
+	// chunkSize: 500K records × ~130 bytes ≈ 65 MB per sorter.
 	// With 3 parallel sorters: 3 × 65 MB = 195 MB peak for chunks.
 	chunkSize = 500_000
 
-	// lowCardinalityThreshold: if the number of distinct values seen during
-	// the first chunkSize records is below this, switch to bucket sort.
-	// continent has exactly 6 values — well below this threshold.
-	// id and name have cardinality ≈ 50M — well above it.
+	// lowCardinalityThreshold: if the number of distinct values seen in the
+	// first chunkSize records is below this, switch to bucket sort.
+	// continent has 6 values (well below); id and name have ~50M (well above).
 	lowCardinalityThreshold = 200
 )
 
@@ -68,7 +67,6 @@ func lessFor(key SortKey) (lessFunc, error) {
 	}
 }
 
-// keyOf extracts the sort key string from a Person for cardinality probing.
 func keyOf(key SortKey, p *data.Person) string {
 	switch key {
 	case SortByID:
@@ -83,44 +81,19 @@ func keyOf(key SortKey, p *data.Person) string {
 
 // ─── Sorter ───────────────────────────────────────────────────────────────────
 
-// Sorter implements an external merge sort (high-cardinality keys like id/name)
-// or a bucket sort (low-cardinality keys like continent) — chosen automatically
-// by probing the first chunk for distinct value count.
+// Sorter implements external merge sort for high-cardinality keys (id, name)
+// and bucket sort for low-cardinality keys (continent). The algorithm is chosen
+// automatically by probing the first chunk for distinct value count.
 //
-// Bucket sort algorithm (continent):
+// Bucket sort (continent):
+//   - Phase 1: route each record into a per-value file — O(N), no in-memory sort.
+//   - Phase 2: stream bucket files to Kafka in sorted key order. Records within
+//     a bucket need no further sorting since the spec only requires ordering by
+//     the sort key, not a secondary key.
 //
-//  1. BUCKET FILL
-//     Consume all 50M records from Kafka.
-//     Route each record into one of N bucket files (one per distinct value)
-//     using a map[string]*bufio.Writer. No sorting at all in this phase —
-//     it's a pure O(N) partitioning pass.
-//
-//  2. SORT EACH BUCKET + STREAM
-//     For each bucket file (sorted key order):
-//     - Read the entire bucket into memory (≈50M/6 ≈ 8.3M records × 130B ≈ 1.08 GB)
-//
-//     Wait — that's too large. Instead we do a mini external-merge within each
-//     bucket: read in chunkSize sub-chunks, sort each, write sub-chunk files,
-//     then k-way merge the sub-chunks for that bucket and stream to Kafka.
-//     Because all records in a bucket share the same key value, the merge is
-//     trivially correct (any order within the bucket is valid for a stable sort
-//     on continent alone).
-//
-//     Actually for continent sort, records within the same continent can be in
-//     ANY order — the spec only says "sorted by continent". So we can skip the
-//     within-bucket sort entirely and just stream each bucket sequentially.
-//
-// Memory profile (bucket sort):
-//
-//	Bucket writers: 6 open file handles + 256 KB buffers each ≈ 1.5 MB
-//	msgCh buffer:  50K × 130 B ≈ 6.5 MB
-//	No chunk array needed in Phase 1 — records go straight to bucket files.
-//	Phase 2: one bucket read at a time via streaming — O(1) memory.
-//
-// External merge sort algorithm (id / name) — unchanged from before:
-//
-//  1. Read source topic in chunks of chunkSize, sort each in memory, write to temp file.
-//  2. K-way heap merge all temp files → stream to Kafka output topic.
+// External merge sort (id, name):
+//   - Phase 1: read source topic in chunkSize chunks, sort each in memory, write to temp file.
+//   - Phase 2: k-way heap merge all temp files → stream to Kafka output topic.
 type Sorter struct {
 	brokers []string
 	key     SortKey
@@ -154,13 +127,6 @@ func (s *Sorter) Run(ctx context.Context) error {
 		return fmt.Errorf("[%s] ensure topic: %w", s.key, err)
 	}
 
-	// Probe cardinality using the first chunk's records.
-	// If distinctValues < lowCardinalityThreshold → bucket sort.
-	// Otherwise → external merge sort.
-	//
-	// We open the Kafka consumer once here for probing, then pass the
-	// already-open consumer into whichever sort path we choose, so we
-	// don't pay the connection cost twice.
 	client, err := sarama.NewClient(s.brokers, newParallelClientConfig())
 	if err != nil {
 		return fmt.Errorf("[%s] new client: %w", s.key, err)
@@ -275,26 +241,16 @@ func (s *Sorter) Run(ctx context.Context) error {
 
 // bucketSort handles fields with few distinct values (e.g. continent = 6 values).
 //
-// Phase 1 — O(N) partitioning:
-//   - One output file per distinct value, opened upfront.
-//   - Each incoming record is routed to its bucket file by map lookup.
-//   - No sorting, no chunk arrays — memory is O(numBuckets) ≈ negligible.
+// Phase 1 — O(N) partitioning: each record is routed to a per-value file by
+// map lookup. No sorting or chunk arrays — memory usage is O(numBuckets).
 //
-// Phase 2 — sequential streaming:
-//   - Buckets are processed in sorted key order (sort.Strings on bucket names).
-//   - Each bucket file is streamed line-by-line directly to Kafka.
-//   - Records within a bucket need no further sorting because the spec only
-//     requires ordering by the sort key (continent), not a secondary key.
-//   - Memory usage during Phase 2: one read buffer per open file ≈ O(1).
-//
-// Total complexity: O(N) vs O(N log N) for external merge sort.
-// For continent with N=50M this saves ~log₂(50M) ≈ 25 comparisons per record.
+// Phase 2 — sequential streaming: bucket files are processed in sorted key
+// order and streamed line-by-line to Kafka. No within-bucket sort is needed
+// since the spec only requires ordering by the sort key.
 func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-chan *data.Person) error {
 	t1 := time.Now()
 	fmt.Printf("[%s] phase1 bucket-fill starting\n", s.key)
 
-	// Open one file per distinct bucket value.
-	// We discover buckets lazily as records arrive.
 	type bucketFile struct {
 		file   *os.File
 		writer *bufio.Writer
@@ -305,7 +261,6 @@ func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-c
 		if b, ok := buckets[val]; ok {
 			return b, nil
 		}
-		// Sanitise value for use as a filename (replace spaces with underscores).
 		safe := strings.ReplaceAll(val, " ", "_")
 		path := filepath.Join(s.tmpDir, fmt.Sprintf("bucket_%s.csv", safe))
 		f, err := os.Create(path)
@@ -314,7 +269,7 @@ func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-c
 		}
 		bf := &bucketFile{
 			file:   f,
-			writer: bufio.NewWriterSize(f, 4*1024*1024), // 4 MB write buffer
+			writer: bufio.NewWriterSize(f, 4*1024*1024),
 		}
 		buckets[val] = bf
 		return bf, nil
@@ -337,7 +292,6 @@ func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-c
 		return err
 	}
 
-	// Write probe records (already consumed from msgCh during cardinality probe).
 	consumed := int64(0)
 	for _, p := range probe {
 		if err := writeRecord(p); err != nil {
@@ -347,7 +301,6 @@ func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-c
 		consumed++
 	}
 
-	// Continue draining msgCh for the rest of the records.
 	for p := range msgCh {
 		select {
 		case <-ctx.Done():
@@ -374,7 +327,6 @@ func (s *Sorter) bucketSort(ctx context.Context, probe []*data.Person, msgCh <-c
 	t2 := time.Now()
 	fmt.Printf("[%s] phase2 bucket-stream starting\n", s.key)
 
-	// Collect and sort bucket keys so output is in correct order.
 	bucketKeys := make([]string, 0, len(buckets))
 	for k := range buckets {
 		bucketKeys = append(bucketKeys, k)
@@ -481,7 +433,6 @@ func (s *Sorter) externalMergeSort(ctx context.Context, probe []*data.Person, ms
 		return nil
 	}
 
-	// Process probe records first (already consumed during cardinality check).
 	for _, p := range probe {
 		chunk = append(chunk, p)
 		consumed++
@@ -492,7 +443,6 @@ func (s *Sorter) externalMergeSort(ctx context.Context, probe []*data.Person, ms
 		}
 	}
 
-	// Continue with remaining records from msgCh.
 	for p := range msgCh {
 		chunk = append(chunk, p)
 		consumed++
@@ -539,7 +489,7 @@ func (s *Sorter) writeChunkFile(chunk []*data.Person, idx int) (string, error) {
 	return path, w.Flush()
 }
 
-// ─── Phase 2: k-way merge (used by external merge sort path only) ─────────────
+// ─── Phase 2: k-way merge ─────────────────────────────────────────────────────
 
 func (s *Sorter) mergeAndProduce(ctx context.Context, chunkFiles []string) error {
 	h := &mergeHeap{less: s.less}
@@ -697,7 +647,7 @@ func (h *mergeHeap) Pop() any {
 
 // ─── Configs ──────────────────────────────────────────────────────────────────
 
-// NewClientConfig is kept for verify.go which runs alone after all sorters.
+// NewClientConfig is used by verify.go after all sorters complete.
 func NewClientConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_6_0_0
@@ -709,8 +659,8 @@ func NewClientConfig() *sarama.Config {
 	return cfg
 }
 
-// newParallelClientConfig: conservative fetch buffers for 3 concurrent sorters.
-// 3 sorters × 3 partitions × 6 MB = 54 MB total fetch buffer (vs 450 MB before).
+// newParallelClientConfig uses conservative fetch buffers for 3 concurrent sorters.
+// 3 sorters × 3 partitions × 6 MB = 54 MB total fetch buffer.
 func newParallelClientConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V2_6_0_0

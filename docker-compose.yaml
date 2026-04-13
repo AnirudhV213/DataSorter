@@ -34,7 +34,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"      # hard cap — kernel throttles if exceeded
+          cpus: "1.5"      # hard cap — kernel throttles if exceeded
           memory: "1GB"    # hard cap — kernel OOM-kills if exceeded
         reservations:
           cpus: "1.0"      # guaranteed minimum so Kafka is never starved

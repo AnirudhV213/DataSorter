@@ -18,9 +18,7 @@ func TestParseCSVLine_Valid(t *testing.T) {
 		{"42,AliceName,12 Main St,Asia", 42, "AliceName", "12 Main St", "Asia"},
 		{"0,BobbySmith,9 Elm Avenue,Europe", 0, "BobbySmith", "9 Elm Avenue", "Europe"},
 		{"50000000,ZNameHere,1 Road Blvd,Africa", 50000000, "ZNameHere", "1 Road Blvd", "Africa"},
-		// Address field contains a comma in the continent — SplitN(4) must handle it.
 		{"7,NameIsHere,3 Blvd St Here,North America", 7, "NameIsHere", "3 Blvd St Here", "North America"},
-		// Negative ID is representable in int32.
 		{"-1,NegIDName,5 Test Road,Australia", -1, "NegIDName", "5 Test Road", "Australia"},
 	}
 
@@ -91,8 +89,8 @@ func TestParseCSVLine_WhitespaceTrimmed(t *testing.T) {
 	}
 }
 
-func TestParseCSVLine_FourthFieldPreservedWithSpaces(t *testing.T) {
-	// "North America" and "South America" contain spaces — must not be split.
+func TestParseCSVLine_ContinentWithSpaces(t *testing.T) {
+	// "North America" and "South America" must not be split by SplitN.
 	for _, cont := range []string{"North America", "South America"} {
 		line := "1,NameHolder,5 Test Road," + cont
 		p, err := ParseCSVLine(line)
@@ -105,35 +103,32 @@ func TestParseCSVLine_FourthFieldPreservedWithSpaces(t *testing.T) {
 	}
 }
 
-// ─── sendBatch validation logic ───────────────────────────────────────────────
+// ─── sendBatch filter ─────────────────────────────────────────────────────────
 
-// sendBatch filters lines with fewer than 3 commas. We verify that logic
-// independently (without a real Kafka producer) by re-testing the filter.
+// sendBatch skips empty lines and lines with fewer than 3 commas.
+// We mirror that filter here to verify the boundary conditions independently.
 func TestSendBatchFilter_CommaCheck(t *testing.T) {
+	check := func(line string) bool {
+		line = strings.TrimSpace(line)
+		return line != "" && strings.Count(line, ",") >= 3
+	}
+
 	valid := []string{
 		"1,Name,Address,Continent",
 		"0,NameHere,1 Road Blvd,Asia",
 	}
+	for _, line := range valid {
+		if !check(line) {
+			t.Errorf("valid line rejected: %q", line)
+		}
+	}
+
 	invalid := []string{
 		"",
 		"   ",
 		"nocommasatall",
 		"one,comma",
 		"two,commas,only",
-	}
-
-	check := func(line string) bool {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			return false
-		}
-		return strings.Count(line, ",") >= 3
-	}
-
-	for _, line := range valid {
-		if !check(line) {
-			t.Errorf("valid line rejected: %q", line)
-		}
 	}
 	for _, line := range invalid {
 		if check(line) {
@@ -161,7 +156,6 @@ func TestRoundRobinPartitioner_Distribution(t *testing.T) {
 		counts[p]++
 	}
 
-	// Each partition should receive exactly msgs/partitions messages.
 	for p, c := range counts {
 		if c != msgs/partitions {
 			t.Errorf("partition %d: got %d messages, want %d", p, c, msgs/partitions)
@@ -190,7 +184,6 @@ func TestRoundRobinPartitioner_SinglePartition(t *testing.T) {
 }
 
 func TestRoundRobinPartitioner_Wraparound(t *testing.T) {
-	// After N*partitions messages, the counter wraps and distribution resets.
 	rr := &roundRobinPartitioner{}
 	const partitions = int32(3)
 	const rounds = 5
@@ -201,16 +194,13 @@ func TestRoundRobinPartitioner_Wraparound(t *testing.T) {
 		results[i] = p
 	}
 
-	// First full round: 0,1,2
-	for i := int32(0); i < partitions; i++ {
-		if results[i] != i {
-			t.Errorf("round 0, slot %d: got partition %d, want %d", i, results[i], i)
-		}
-	}
-	// Second full round: 0,1,2 again
-	for i := int32(0); i < partitions; i++ {
-		if results[int(partitions)+int(i)] != i {
-			t.Errorf("round 1, slot %d: got partition %d, want %d", i, results[int(partitions)+int(i)], i)
+	// Verify the first two full rounds are 0,1,2 each.
+	for round := 0; round < 2; round++ {
+		for i := int32(0); i < partitions; i++ {
+			got := results[round*int(partitions)+int(i)]
+			if got != i {
+				t.Errorf("round %d, slot %d: got partition %d, want %d", round, i, got, i)
+			}
 		}
 	}
 }
