@@ -58,13 +58,8 @@ Both options print a step-by-step summary when the pipeline finishes:
 
 ## Verify correctness (optional)
 
-On Linux/macOS:
-```bash
-./scripts/verify.sh
 ```
-On Windows:
-```bat
-scripts\verify.bat
+bash scripts/verify.sh
 ```
 
 Prints the first 10 records from each output topic. Check that:
