@@ -58,6 +58,11 @@ Both options print a step-by-step summary when the pipeline finishes:
 
 ## Verify correctness (optional)
 
+Direct Link to download verify.sh file from repository
+```
+https://raw.githubusercontent.com/AnirudhV213/DataSorter/main/scripts/verify.sh
+```
+Then Run this command to verify the sorted data
 ```
 bash scripts/verify.sh
 ```
