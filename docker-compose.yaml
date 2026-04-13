@@ -25,19 +25,15 @@ services:
       KAFKA_NUM_NETWORK_THREADS: 3
       KAFKA_NUM_IO_THREADS: 4
 
-      # Pin JVM heap to exactly 512MB.
-      # Without this the JVM auto-sizes to 25% of container RAM and its
-      # off-heap buffers blow the budget unpredictably.
-      # Setting Xms == Xmx also prevents heap resize pauses during GC.
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
 
     deploy:
       resources:
         limits:
-          cpus: "1.5"      # hard cap — kernel throttles if exceeded
-          memory: "1GB"    # hard cap — kernel OOM-kills if exceeded
+          cpus: "1.5"
+          memory: "1GB"
         reservations:
-          cpus: "1.0"      # guaranteed minimum so Kafka is never starved
+          cpus: "1.0"
           memory: "600MB"
 
     healthcheck:
@@ -45,10 +41,12 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
-      start_period: 30s    # give KRaft time to elect itself on first boot
+      start_period: 30s
 
   app:
-    image: golang:1.26.1
+    image: aavv4/datasorter-app:latest   # pulled from Docker Hub if it exists
+    build:
+      context: .                          # fallback: build from source if image not found
     container_name: go-app
 
     depends_on:
@@ -57,25 +55,13 @@ services:
 
     environment:
       KAFKA_BROKERS: kafka:9092
-
-      # Tell the Go scheduler how many OS threads to use.
-      # Without this Go reads the HOST cpu count (14 in your machine) and
-      # creates 14 threads that all fight for the 2 CPUs this container
-      # is actually allowed — causing the 300-500% CPU spike you saw.
       GOMAXPROCS: "2"
-
-    working_dir: /app
-
-    volumes:
-      - .:/app
-
-    command: ["go", "run", "./cmd/main.go"]
 
     deploy:
       resources:
         limits:
-          cpus: "2.0"      # Go app gets the other 2 of the 4 total cores
-          memory: "1GB"    # leaves 1GB for Kafka on the same host
+          cpus: "2.0"
+          memory: "1GB"
         reservations:
           cpus: "0.5"
           memory: "200MB"

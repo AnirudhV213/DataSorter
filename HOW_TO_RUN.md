@@ -6,8 +6,11 @@
 
 ## Option 1 — Pull image from Docker Hub (recommended)
 
-No source code needed. Just run:
-
+Direct Link to download docker-compose file from repository
+```bash
+https://raw.githubusercontent.com/AnirudhV213/DataSorter/main/docker-compose.yaml
+```
+No source code needed. Just download the docker-compose.yaml from the repo and run:
 ```bash
 docker compose up
 ```
@@ -26,6 +29,8 @@ docker compose down
 Use this if you have cloned the repo and want to build the image yourself.
 
 ```bash
+git clone https://github.com/AnirudhV16/DataSorter.git
+cd DataSorter
 docker compose up --build
 ```
 
