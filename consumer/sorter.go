@@ -647,6 +647,7 @@ func (h *mergeHeap) Pop() any {
 
 // ─── Configs ──────────────────────────────────────────────────────────────────
 
+/* verify.go is removed
 // NewClientConfig is used by verify.go after all sorters complete.
 func NewClientConfig() *sarama.Config {
 	cfg := sarama.NewConfig()
@@ -657,7 +658,7 @@ func NewClientConfig() *sarama.Config {
 	cfg.Consumer.MaxWaitTime = 500 * time.Millisecond
 	cfg.Consumer.Retry.Backoff = 200 * time.Millisecond
 	return cfg
-}
+}*/
 
 // newParallelClientConfig uses conservative fetch buffers for 3 concurrent sorters.
 // 3 sorters × 3 partitions × 6 MB = 54 MB total fetch buffer.
