@@ -149,6 +149,9 @@ bucket_South_America.csv
 
 Every record from the source topic is routed into its continent's bucket file. In Phase 2, the bucket files are streamed to Kafka in alphabetical order, producing a fully sorted continent topic without any in-memory sort.
 
+The sorted chunks and bucket files
+
+![alt text](docs/sorted_files.png)
 ---
 
 ### Memory vs. disk tradeoff
