@@ -51,14 +51,12 @@ func (p *Person) ToCSV() string {
 
 // Generator holds configuration and a seeded random source for data generation.
 type Generator struct {
-	flag int
-	rng  *rand.Rand
+	rng *rand.Rand
 }
 
 func NewGenerator() *Generator {
 	return &Generator{
-		flag: 1,
-		rng:  rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
